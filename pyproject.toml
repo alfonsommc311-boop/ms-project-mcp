@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = []
+
+[project]
+name = "ms-project-mcp"
+version = "0.1.0"
+description = "MCP server for Microsoft Project via COM automation"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "pywin32>=306",
+    "python-dateutil>=2.9.0",
+]
