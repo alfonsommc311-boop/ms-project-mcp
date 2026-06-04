@@ -314,6 +314,21 @@ Single-file server (`server.py`, ~5,200 lines) using the FastMCP framework. All 
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, conventions, and how to submit changes.
 
-## License
+## Docs
 
-This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
+- [docs/PRODUCT.md](docs/PRODUCT.md) — product overview, editions and pricing.
+- [docs/RECIPES.md](docs/RECIPES.md) — ready-to-run vertical workflows (road
+  construction, EVM, weekly PMO status).
+- [ROADMAP_COMERCIAL.md](ROADMAP_COMERCIAL.md) — commercialization roadmap.
+
+## License & commercial use
+
+Dual-licensed:
+
+- **Open source:** MIT License — see [LICENSE](LICENSE). Provided "AS IS".
+- **Commercial:** an optional commercial license ([EULA.md](EULA.md)) adds
+  warranty, support, updates and indemnification. See [docs/PRODUCT.md](docs/PRODUCT.md).
+
+Attribution and trademark notices: see [NOTICE](NOTICE). "Microsoft Project®" is a
+trademark of Microsoft Corporation; this product is independent and not affiliated
+with Microsoft.
