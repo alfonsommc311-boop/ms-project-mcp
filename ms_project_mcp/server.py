@@ -44,6 +44,24 @@ def _as_bool(v):
         return v.strip().lower() in ("1", "true", "yes", "y", "si", "sí", "on")
     return bool(v)
 
+
+def _save_if_active(app, proj):
+    """Save ONLY when the mutated target project is the active one.
+
+    MS Project's FileSave targets the ACTIVE project, but this server uses a
+    deterministic target-project model (proj may not be the UI-active project).
+    Saving the active file when proj != active would write the wrong project, so
+    skip the save in that case (the change still persists in memory; the caller
+    can save that project). Returns True if it actually saved."""
+    try:
+        active = app.ActiveProject
+        if proj is not None and active is not None and proj.Name == active.Name:
+            app.FileSave()
+            return True
+    except Exception:
+        pass
+    return False
+
 # ---------------------------------------------------------------------------
 # COM helpers
 # ---------------------------------------------------------------------------
@@ -2230,7 +2248,7 @@ def set_calendar_exception(
     # Exceptions.Add creates a NON-WORKING (holiday) exception. Applying custom
     # working shifts is not implemented, so reject working=true rather than
     # report a state the calendar does not actually have.
-    if working:
+    if _as_bool(working):
         return json.dumps({"error": "working=true exceptions are not supported by this tool; "
                                     "it creates non-working (holiday) exceptions. Use working=false."})
 
@@ -3170,7 +3188,7 @@ def bulk_assign_resources(assignments_json: str) -> str:
         app.CalculateProject()
         app.Calculation = -1
 
-    app.FileSave()  # persist, consistent with the other mutating tools
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "assigned":          assigned,
         "errors":            errors,
@@ -3211,7 +3229,7 @@ def remove_resource_assignment(task_unique_id: int, resource_name: str) -> str:
     if removed == 0:
         return json.dumps({"error": f"Resource '{resource_name}' not assigned to task '{t.Name}'. Current: {t.ResourceNames}"})
 
-    app.FileSave()  # persist, consistent with the other mutating tools
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "status":             "removed",
         "task_name":          t.Name,
@@ -3262,7 +3280,7 @@ def update_resource(resource_name: str, new_name: str = "", max_units: float = -
         changed.append("cost_per_use")
 
     if changed:
-        app.FileSave()  # persist, consistent with the other mutating tools
+        _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "status":  "updated",
         "name":    resource.Name,
@@ -3315,7 +3333,7 @@ def move_task(unique_id: int, after_unique_id: int) -> str:
     moved = _find_task(proj, unique_id)
     new_id = moved.ID if moved else None
 
-    app.FileSave()  # persist, consistent with the other mutating tools
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "status":    "moved",
         "unique_id": unique_id,
@@ -3434,7 +3452,7 @@ def copy_task_structure(source_unique_id: int, copies: int = 1) -> str:
                     "name":      t.Name,
                 })
 
-    app.FileSave()  # persist, consistent with the other mutating tools
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "status":       "copied",
         "source_name":  source.Name,
@@ -3900,7 +3918,7 @@ def insert_subproject(file_path: str, after_unique_id: int = 0) -> str:
 
     count_after = proj.Tasks.Count
 
-    app.FileSave()  # persist, consistent with the other mutating tools
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "status":           "inserted",
         "file_path":        file_path,
