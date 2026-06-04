@@ -9,7 +9,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from server import mcp
+from ms_project_mcp.server import mcp
 
 PASS = 0
 FAIL = 0

@@ -5297,10 +5297,15 @@ def what_if_delay(
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main():
+    """Console-script / module entry point. Starts the MCP server over stdio."""
     print("Starting MS Project MCP Server...")
     print("MS Project must be running with a file open before using tools.")
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
 
 
 # ---------------------------------------------------------------------------
