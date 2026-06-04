@@ -45,22 +45,40 @@ def _as_bool(v):
     return bool(v)
 
 
+def _same_project(a, b):
+    """Stable identity match between two project objects. Prefer FullName (full
+    path, unique for saved files); fall back to Name for unsaved projects."""
+    if a is None or b is None:
+        return False
+    try:
+        fa, fb = a.FullName, b.FullName
+        if fa and fb:
+            return fa == fb
+    except Exception:
+        pass
+    try:
+        return a.Name == b.Name
+    except Exception:
+        return False
+
+
 def _save_if_active(app, proj):
     """Save ONLY when the mutated target project is the active one.
 
     MS Project's FileSave targets the ACTIVE project, but this server uses a
     deterministic target-project model (proj may not be the UI-active project).
-    Saving the active file when proj != active would write the wrong project, so
-    skip the save in that case (the change still persists in memory; the caller
-    can save that project). Returns True if it actually saved."""
+    Saving when proj != active would write the wrong file, so skip the save then
+    (the change still persists in memory; the caller can save that project).
+    FileSave failures are NOT swallowed — they propagate so callers don't report
+    a successful mutation as saved when it wasn't. Returns True if it saved."""
     try:
         active = app.ActiveProject
-        if proj is not None and active is not None and proj.Name == active.Name:
-            app.FileSave()
-            return True
     except Exception:
-        pass
-    return False
+        active = None
+    if not _same_project(proj, active):
+        return False
+    app.FileSave()  # let read-only/disk/prompt errors propagate to the caller
+    return True
 
 # ---------------------------------------------------------------------------
 # COM helpers
