@@ -6,11 +6,43 @@ Run:     python server.py
 Register in claude_desktop_config.json (see bottom of file).
 """
 
+import os
 import json
 import datetime
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("MS Project")
+
+# ---------------------------------------------------------------------------
+# Hardening helpers
+# ---------------------------------------------------------------------------
+
+# Safe mode (default ON): destructive/irreversible tools require confirm=true.
+# Disable per deployment with MSPROJECT_MCP_SAFE_MODE=0.
+SAFE_MODE = str(os.environ.get("MSPROJECT_MCP_SAFE_MODE", "1")).strip().lower() \
+    not in ("0", "false", "no", "off")
+
+
+def _require_confirm(confirm, action):
+    """Gate a destructive action. In safe mode it must be called with confirm=True."""
+    if SAFE_MODE and not confirm:
+        raise RuntimeError(
+            "Safe mode: '%s' is destructive/irreversible and requires confirm=true. "
+            "Re-issue the call with confirm=true once you're sure "
+            "(or set env MSPROJECT_MCP_SAFE_MODE=0 to disable safe mode)." % action
+        )
+
+
+def _as_bool(v):
+    """Robust truthiness for JSON/string inputs: 'false'/'0'/'no'/'off'/'' -> False
+    (plain bool(value) is wrong because bool('false') is True)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y", "si", "sí", "on")
+    return bool(v)
 
 # ---------------------------------------------------------------------------
 # COM helpers
@@ -332,11 +364,14 @@ def save_project() -> str:
 
 
 @mcp.tool()
-def save_project_as(file_path: str, format: str = "mpp") -> str:
+def save_project_as(file_path: str, format: str = "mpp", confirm: bool = False) -> str:
     """
     Save the active project to a new path.
     format: 'mpp' (default), 'xml', 'csv'
+    Overwriting an EXISTING file requires confirm=true in safe mode.
     """
+    if os.path.exists(file_path):
+        _require_confirm(confirm, "save_project_as (overwrite existing %s)" % file_path)
     fmt_map = {"mpp": 0, "xml": 22, "csv": 23}
     fmt_id  = fmt_map.get(format.lower(), 0)
     app     = get_app()
@@ -345,8 +380,11 @@ def save_project_as(file_path: str, format: str = "mpp") -> str:
 
 
 @mcp.tool()
-def close_project(save: bool = False) -> str:
-    """Close the active project. Set save=True to save before closing."""
+def close_project(save: bool = False, confirm: bool = False) -> str:
+    """Close the active project. Set save=True to save before closing.
+    Closing with save=False DISCARDS unsaved changes and requires confirm=true in safe mode."""
+    if not save:
+        _require_confirm(confirm, "close_project (discard unsaved changes)")
     app = get_app()
     app.FileClose(Save=1 if save else 0)
     return "Project closed."
@@ -532,6 +570,8 @@ def update_task(
         if name:
             t.Name = name;              changed.append("name")
         if percent_complete >= 0:
+            if percent_complete > 100:
+                return json.dumps({"error": "percent_complete must be 0-100."})
             t.PercentComplete = percent_complete; changed.append("percent_complete")
         if notes:
             t.Notes = notes;            changed.append("notes")
@@ -554,6 +594,8 @@ def update_task(
         if flag2 is not None:
             t.Flag2 = flag2;            changed.append("flag2")
         if priority >= 0:
+            if priority > 1000:
+                return json.dumps({"error": "priority must be 0-1000."})
             t.Priority = priority;      changed.append("priority")
         if task_type:
             TYPE_MAP = {"fixedunits": 0, "fixedduration": 1, "fixedwork": 2}
@@ -699,7 +741,15 @@ def add_task(
     app.Calculation = 0
 
     try:
-        task = proj.Tasks.Add(name)
+        # Honor after_unique_id: insert right after that task (MS Project inserts
+        # at the given sequential ID). 0 (or unset) -> append at end.
+        if after_unique_id and after_unique_id > 0:
+            _after = _find_task(proj, after_unique_id)
+            if _after is None:
+                return json.dumps({"error": f"after_unique_id {after_unique_id} not found."})
+            task = proj.Tasks.Add(name, _after.ID + 1)
+        else:
+            task = proj.Tasks.Add(name)
         task.OutlineLevel  = outline_level
         task.Milestone     = milestone
         if milestone:
@@ -800,8 +850,9 @@ def bulk_add_tasks(tasks_json: str) -> str:
 
 
 @mcp.tool()
-def delete_task(unique_id: int) -> str:
-    """Delete a task by its UniqueID. This cannot be undone after save."""
+def delete_task(unique_id: int, confirm: bool = False) -> str:
+    """Delete a task by its UniqueID. Irreversible after save — requires confirm=true in safe mode."""
+    _require_confirm(confirm, "delete_task (unique_id=%s)" % unique_id)
     app  = get_app()
     proj = get_proj(app)
 
@@ -1640,9 +1691,9 @@ def save_baseline(baseline_number: int = 0, all_tasks: bool = True) -> str:
 
 
 @mcp.tool()
-def clear_baseline(baseline_number: int = 0, all_tasks: bool = True) -> str:
+def clear_baseline(baseline_number: int = 0, all_tasks: bool = True, confirm: bool = False) -> str:
     """
-    Clear a previously saved baseline.
+    Clear a previously saved baseline. Irreversible after save — requires confirm=true in safe mode.
 
     Args:
         baseline_number: 0 to 10. Default 0.
@@ -1650,6 +1701,7 @@ def clear_baseline(baseline_number: int = 0, all_tasks: bool = True) -> str:
     """
     if baseline_number < 0 or baseline_number > 10:
         return json.dumps({"error": "baseline_number must be 0-10."})
+    _require_confirm(confirm, "clear_baseline (baseline %s)" % baseline_number)
 
     app = get_app()
     app.BaselineClear(All=all_tasks, From=baseline_number)
@@ -2233,7 +2285,7 @@ def update_custom_fields(unique_id: int, fields_json: str) -> str:
             if field_type == "date":
                 value = _parse_date(value)
             elif field_type == "flag":
-                value = bool(value)
+                value = _as_bool(value)  # 'false'/'0'/'no' -> False (bool('false') would be True)
             elif field_type == "duration":
                 value = float(value) * mpd
             elif field_type == "number":
@@ -3868,11 +3920,13 @@ def get_constraints() -> str:
 
 
 @mcp.tool()
-def delete_resource(resource_name: str) -> str:
+def delete_resource(resource_name: str, confirm: bool = False) -> str:
     """
     Delete a resource from the project pool (case-insensitive match).
     All task assignments referencing this resource are cleared first.
+    Irreversible after save — requires confirm=true in safe mode.
     """
+    _require_confirm(confirm, "delete_resource (%s)" % resource_name)
     app  = get_app()
     proj = get_proj(app)
 
