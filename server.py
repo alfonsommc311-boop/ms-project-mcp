@@ -64,7 +64,32 @@ def get_app(require_project=True):
     return app
 
 
+# Deterministic target project. Tools that create/open/switch a project record
+# its name here so later calls operate on the intended project regardless of
+# which MS Project window is frontmost — app.ActiveProject follows UI focus and
+# is unreliable for automation (caused tasks to land in the wrong project).
+# Falls back to ActiveProject when unset or the target was closed.
+_TARGET_PROJECT = None
+
+
+def _set_target_project(proj):
+    global _TARGET_PROJECT
+    try:
+        _TARGET_PROJECT = proj.Name
+    except Exception:
+        _TARGET_PROJECT = None
+
+
 def get_proj(app):
+    global _TARGET_PROJECT
+    if _TARGET_PROJECT:
+        for p in app.Projects:
+            try:
+                if p is not None and p.Name == _TARGET_PROJECT:
+                    return p
+            except Exception:
+                continue
+        _TARGET_PROJECT = None  # target was closed → fall back
     return app.ActiveProject
 
 
@@ -74,6 +99,13 @@ def _get_mpd(proj):
         return proj.MinutesPerDay
     except Exception:
         return 480
+
+
+# MS Project task-link type constants (pjTaskLinkType) — locale-independent.
+# Setting links via TaskDependencies.Add avoids the localized Predecessors text
+# parser, which rejects English codes in non-English Project (e.g. Spanish needs
+# "3FC" instead of "3FS"). See ROADMAP_COMERCIAL.md, Fase 1.
+PJ_LINK_TYPE = {"FF": 0, "FS": 1, "SF": 2, "SS": 3}
 
 
 def _parse_date(s):
@@ -233,6 +265,7 @@ def open_project(file_path: str) -> str:
 
     app.FileOpen(file_path)
     proj = app.ActiveProject
+    _set_target_project(proj)
     return json.dumps({
         "status":     "opened",
         "name":       proj.Name,
@@ -265,6 +298,7 @@ def new_project(title: str = "New Project", start: str = "") -> str:
     proj.Title = title
     if start:
         proj.ProjectStart = _parse_date(start)
+    _set_target_project(proj)
 
     return json.dumps({
         "status": "created",
@@ -383,10 +417,20 @@ def save_project_as(file_path: str, format: str = "mpp", confirm: bool = False) 
 def close_project(save: bool = False, confirm: bool = False) -> str:
     """Close the active project. Set save=True to save before closing.
     Closing with save=False DISCARDS unsaved changes and requires confirm=true in safe mode."""
+    global _TARGET_PROJECT
     if not save:
         _require_confirm(confirm, "close_project (discard unsaved changes)")
     app = get_app()
+    proj = get_proj(app)
+    closed_name = None
+    try:
+        closed_name = proj.Name
+        proj.Activate()  # close the intended (target) project, not just the frontmost window
+    except Exception:
+        pass
     app.FileClose(Save=1 if save else 0)
+    if closed_name and closed_name == _TARGET_PROJECT:
+        _TARGET_PROJECT = None
     return "Project closed."
 
 
@@ -1074,40 +1118,37 @@ def add_predecessor(
     app  = get_app()
     proj = get_proj(app)
 
-    uid_to_id = {t.UniqueID: t.ID for t in proj.Tasks if t is not None}
+    lt = str(link_type or "FS").upper().strip()
+    if lt not in PJ_LINK_TYPE:
+        return json.dumps({"error": f"Invalid link_type '{link_type}'. Use FS, SS, FF, or SF."})
 
-    if successor_unique_id not in uid_to_id:
-        return json.dumps({"error": f"Successor UniqueID {successor_unique_id} not found."})
-    if predecessor_unique_id not in uid_to_id:
+    pred_task = _find_task(proj, predecessor_unique_id)
+    succ_task = _find_task(proj, successor_unique_id)
+    if pred_task is None:
         return json.dumps({"error": f"Predecessor UniqueID {predecessor_unique_id} not found."})
+    if succ_task is None:
+        return json.dumps({"error": f"Successor UniqueID {successor_unique_id} not found."})
 
-    pred_id = uid_to_id[predecessor_unique_id]
-    succ_task = None
-    for t in proj.Tasks:
-        if t is not None and t.UniqueID == successor_unique_id:
-            succ_task = t
-            break
-
-    lag_str = ""
-    if lag_days > 0:
-        lag_str = f"+{lag_days}d"
-    elif lag_days < 0:
-        lag_str = f"{lag_days}d"
-
-    existing = succ_task.Predecessors.strip()
-    new_pred  = f"{pred_id}{link_type}{lag_str}"
-
-    if existing:
-        succ_task.Predecessors = existing + "," + new_pred
-    else:
-        succ_task.Predecessors = new_pred
+    # Use the COM object model (locale-independent) instead of the localized
+    # Predecessors text field, which rejects English codes in non-English Project.
+    try:
+        # Add() with only the predecessor creates a Finish-to-Start link; the
+        # .Type property (enum 0=FF,1=FS,2=SF,3=SS) sets SS/FF/SF. This object-model
+        # path is locale-independent — no "3FS" text parse that ES Project rejects.
+        dep = succ_task.TaskDependencies.Add(pred_task)
+        dep.Type = PJ_LINK_TYPE[lt]
+        if lag_days:
+            dep.Lag = int(round(lag_days * _get_mpd(proj)))
+    except Exception as e:
+        return json.dumps({"error": f"Could not link tasks: {e}"})
 
     app.FileSave()
     return json.dumps({
         "status":       "linked",
         "successor":    successor_unique_id,
         "predecessor":  predecessor_unique_id,
-        "link":         new_pred,
+        "link_type":    lt,
+        "lag_days":     lag_days,
         "predecessors": succ_task.Predecessors,
     }, indent=2)
 
@@ -1126,8 +1167,8 @@ def bulk_add_predecessors(links_json: str) -> str:
     app   = get_app()
     proj  = get_proj(app)
 
-    uid_to_id = {t.UniqueID: t.ID for t in proj.Tasks if t is not None}
     uid_to_task = {t.UniqueID: t for t in proj.Tasks if t is not None}
+    mpd = _get_mpd(proj)
 
     linked = 0
     errors = []
@@ -1135,34 +1176,32 @@ def bulk_add_predecessors(links_json: str) -> str:
     for link in links:
         succ_uid = link["successor_unique_id"]
         pred_uid = link["predecessor_unique_id"]
-        lt       = link.get("link_type", "FS")
+        lt       = str(link.get("link_type", "FS")).upper().strip()
         lag      = link.get("lag_days", 0)
 
-        if succ_uid not in uid_to_id:
+        if lt not in PJ_LINK_TYPE:
+            errors.append({"successor_unique_id": succ_uid, "error": f"invalid link_type '{lt}'"})
+            continue
+
+        succ_task = uid_to_task.get(succ_uid)
+        pred_task = uid_to_task.get(pred_uid)
+        if succ_task is None:
             errors.append({"successor_unique_id": succ_uid, "error": "not found"})
             continue
-        if pred_uid not in uid_to_id:
+        if pred_task is None:
             errors.append({"predecessor_unique_id": pred_uid, "error": "not found"})
             continue
 
-        pred_id   = uid_to_id[pred_uid]
-        succ_task = uid_to_task[succ_uid]
-
-        lag_str = ""
-        if lag > 0:
-            lag_str = f"+{lag}d"
-        elif lag < 0:
-            lag_str = f"{lag}d"
-
-        new_pred = f"{pred_id}{lt}{lag_str}"
-        existing = succ_task.Predecessors.strip()
-
-        if existing:
-            succ_task.Predecessors = existing + "," + new_pred
-        else:
-            succ_task.Predecessors = new_pred
-
-        linked += 1
+        # Locale-independent link via the COM object model (see add_predecessor).
+        # Per-link try/except → partial success instead of all-or-nothing abort.
+        try:
+            dep = succ_task.TaskDependencies.Add(pred_task)
+            dep.Type = PJ_LINK_TYPE[lt]
+            if lag:
+                dep.Lag = int(round(lag * mpd))
+            linked += 1
+        except Exception as e:
+            errors.append({"successor_unique_id": succ_uid, "predecessor_unique_id": pred_uid, "error": str(e)})
 
     app.FileSave()
     return json.dumps({
@@ -1349,24 +1388,25 @@ def assign_resource(task_unique_id: int, resource_name: str, units: float = 1.0)
     if task is None:
         return json.dumps({"error": f"Task UniqueID {task_unique_id} not found."})
 
-    # Check if resource exists, create if not
-    res_exists = False
+    # Find or create the resource (capture the object for its ID).
+    res = None
     for r in proj.Resources:
         if r is not None and r.Name.lower() == resource_name.lower():
-            res_exists = True
+            res = r
             break
-    if not res_exists:
-        proj.Resources.Add(resource_name)
+    if res is None:
+        res = proj.Resources.Add(resource_name)
 
-    # Append to ResourceNames (handles existing assignments)
-    existing = (task.ResourceNames or "").strip()
-    if existing:
-        # Check if already assigned
-        existing_names = [n.strip().lower() for n in existing.split(",")]
-        if resource_name.lower() not in existing_names:
-            task.ResourceNames = existing + "," + resource_name
-    else:
-        task.ResourceNames = resource_name
+    # Assign via the Assignments object model and set Units explicitly.
+    # Units = % allocation for work resources, or QUANTITY for material resources
+    # (the localized ResourceNames text path silently dropped material quantities).
+    already = any(
+        a is not None and (a.ResourceName or "").lower() == resource_name.lower()
+        for a in task.Assignments
+    )
+    if not already:
+        a = task.Assignments.Add(task.ID, res.ID)
+        a.Units = units
 
     app.FileSave()
     return json.dumps({
@@ -1374,6 +1414,7 @@ def assign_resource(task_unique_id: int, resource_name: str, units: float = 1.0)
         "task_unique_id": task_unique_id,
         "task_name":      task.Name,
         "resource_name":  resource_name,
+        "units":          units,
         "resource_names": task.ResourceNames,
     }, indent=2)
 
@@ -1858,6 +1899,7 @@ def switch_project(name_or_index: str) -> str:
         if 1 <= idx <= app.Projects.Count:
             p = app.Projects(idx)
             p.Activate()
+            _set_target_project(p)
             return json.dumps({
                 "status":     "switched",
                 "name":       p.Name,
@@ -1887,6 +1929,7 @@ def switch_project(name_or_index: str) -> str:
         return json.dumps({"error": f"Multiple matches for '{name_or_index}': {names}. Be more specific."})
 
     _, p = matches[0]
+    _set_target_project(p)
     try:
         active = app.ActiveProject.Name
         if active == p.Name:
@@ -3038,11 +3081,7 @@ def bulk_assign_resources(assignments_json: str) -> str:
     app.Calculation = 0
     try:
         uid_map = {t.UniqueID: t for t in proj.Tasks if t is not None}
-        # Get existing resource names
-        existing_resources = set()
-        for r in proj.Resources:
-            if r is not None:
-                existing_resources.add(r.Name.lower())
+        res_map = {r.Name.lower(): r for r in proj.Resources if r is not None}
 
         assigned = 0
         errors = []
@@ -3051,28 +3090,37 @@ def bulk_assign_resources(assignments_json: str) -> str:
         for item in items:
             task_uid = item["task_unique_id"]
             res_name = item["resource_name"]
+            units    = item.get("units", 1.0)
 
             t = uid_map.get(task_uid)
             if t is None:
                 errors.append({"task_unique_id": task_uid, "error": "task not found"})
                 continue
 
-            # Create resource if needed
-            if res_name.lower() not in existing_resources:
-                proj.Resources.Add(res_name)
-                existing_resources.add(res_name.lower())
+            # Find or create the resource (capture the object for its ID).
+            res = res_map.get(res_name.lower())
+            if res is None:
+                res = proj.Resources.Add(res_name)
+                res_map[res_name.lower()] = res
                 created_resources.append(res_name)
 
-            # Append to ResourceNames
-            existing = (t.ResourceNames or "").strip()
-            if existing:
-                existing_names = [n.strip().lower() for n in existing.split(",")]
-                if res_name.lower() not in existing_names:
-                    t.ResourceNames = existing + "," + res_name
-            else:
-                t.ResourceNames = res_name
+            # Skip if already assigned to this task.
+            already = any(
+                a is not None and (a.ResourceName or "").lower() == res_name.lower()
+                for a in t.Assignments
+            )
+            if already:
+                continue
 
-            assigned += 1
+            # Assign via the object model. Units = % for work resources, or the
+            # QUANTITY for material resources — the old ResourceNames text path
+            # silently dropped material quantities (left them at 1).
+            try:
+                a = t.Assignments.Add(t.ID, res.ID)
+                a.Units = units
+                assigned += 1
+            except Exception as e:
+                errors.append({"task_unique_id": task_uid, "resource_name": res_name, "error": str(e)})
     finally:
         app.CalculateProject()
         app.Calculation = -1
@@ -3100,22 +3148,28 @@ def remove_resource_assignment(task_unique_id: int, resource_name: str) -> str:
     if t is None:
         return json.dumps({"error": f"Task UniqueID {task_unique_id} not found."})
 
-    existing = (t.ResourceNames or "").strip()
-    if not existing:
-        return json.dumps({"error": f"Task '{t.Name}' has no resources assigned."})
+    # Match on the assignment's clean ResourceName (no "[N]" quantity suffix that
+    # the old ResourceNames-string comparison choked on for materials) and Delete()
+    # the assignment object. Iterate in reverse to avoid index shifting.
+    removed = 0
+    for i in range(t.Assignments.Count, 0, -1):
+        a = t.Assignments(i)
+        try:
+            nm = (a.ResourceName or "")
+        except Exception:
+            nm = ""
+        if nm.lower() == resource_name.lower():
+            a.Delete()
+            removed += 1
 
-    names = [n.strip() for n in existing.split(",")]
-    filtered = [n for n in names if n.lower() != resource_name.lower()]
-
-    if len(filtered) == len(names):
-        return json.dumps({"error": f"Resource '{resource_name}' not assigned to task '{t.Name}'. Current: {existing}"})
-
-    t.ResourceNames = ",".join(filtered) if filtered else ""
+    if removed == 0:
+        return json.dumps({"error": f"Resource '{resource_name}' not assigned to task '{t.Name}'. Current: {t.ResourceNames}"})
 
     return json.dumps({
-        "status":           "removed",
-        "task_name":        t.Name,
-        "removed":          resource_name,
+        "status":             "removed",
+        "task_name":          t.Name,
+        "removed":            resource_name,
+        "count":              removed,
         "resource_names_now": t.ResourceNames,
     }, indent=2)
 
