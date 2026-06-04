@@ -562,6 +562,13 @@ def update_task(
     proj = get_proj(app)
     mpd  = _get_mpd(proj)
 
+    # Validate ranged inputs BEFORE mutating anything — COM writes are immediate,
+    # so a late range error would otherwise leave the task partially changed.
+    if percent_complete >= 0 and percent_complete > 100:
+        return json.dumps({"error": "percent_complete must be 0-100."})
+    if priority >= 0 and priority > 1000:
+        return json.dumps({"error": "priority must be 0-1000."})
+
     for t in proj.Tasks:
         if t is None or t.UniqueID != unique_id:
             continue
@@ -570,8 +577,6 @@ def update_task(
         if name:
             t.Name = name;              changed.append("name")
         if percent_complete >= 0:
-            if percent_complete > 100:
-                return json.dumps({"error": "percent_complete must be 0-100."})
             t.PercentComplete = percent_complete; changed.append("percent_complete")
         if notes:
             t.Notes = notes;            changed.append("notes")
@@ -594,8 +599,6 @@ def update_task(
         if flag2 is not None:
             t.Flag2 = flag2;            changed.append("flag2")
         if priority >= 0:
-            if priority > 1000:
-                return json.dumps({"error": "priority must be 0-1000."})
             t.Priority = priority;      changed.append("priority")
         if task_type:
             TYPE_MAP = {"fixedunits": 0, "fixedduration": 1, "fixedwork": 2}
