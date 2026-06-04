@@ -51,6 +51,14 @@ def _as_bool(v):
 def get_app(require_project=True):
     """Get running MS Project instance. Raises if not running."""
     import win32com.client
+    # Ensure COM is initialized on THIS thread. FastMCP may dispatch tools on
+    # worker threads; without CoInitialize, GetActiveObject can fail intermittently
+    # ("CoInitialize has not been called"). Idempotent/cheap; ignore if already init.
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
     try:
         app = win32com.client.GetActiveObject("MSProject.Application")
     except Exception:
@@ -703,6 +711,22 @@ def bulk_update_tasks(updates_json: str) -> str:
             Example: '[{"unique_id": 42, "rag": "Red", "percent_complete": 50}]'
     """
     items = json.loads(updates_json)
+    if not isinstance(items, list):
+        return json.dumps({"error": "updates_json must be a JSON list."})
+    # Pre-validate EVERY item before mutating, so a bad item can't leave partial updates.
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or "unique_id" not in item:
+            return json.dumps({"error": f"Item {i}: 'unique_id' is required."})
+        for _df in ("start", "finish"):
+            if item.get(_df):
+                try:
+                    _parse_date(item[_df])
+                except Exception:
+                    return json.dumps({"error": f"Item {i}: invalid {_df} '{item[_df]}' (use YYYY-MM-DD)."})
+        _pc = item.get("percent_complete")
+        if isinstance(_pc, (int, float)) and (_pc < 0 or _pc > 100):
+            return json.dumps({"error": f"Item {i}: percent_complete must be 0-100."})
+
     app   = get_app()
     proj  = get_proj(app)
     mpd   = _get_mpd(proj)
@@ -844,6 +868,20 @@ def bulk_add_tasks(tasks_json: str) -> str:
                        {"name": "Task A", "outline_level": 2, "start": "2026-04-01"}]'
     """
     tasks = json.loads(tasks_json)
+    if not isinstance(tasks, list):
+        return json.dumps({"error": "tasks_json must be a JSON list."})
+    # Pre-validate EVERY item before mutating, so a bad item (missing name / bad
+    # date) can't leave the project with partial inserts.
+    for i, item in enumerate(tasks):
+        if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+            return json.dumps({"error": f"Item {i}: 'name' is required."})
+        for _df in ("start", "finish"):
+            if item.get(_df):
+                try:
+                    _parse_date(item[_df])
+                except Exception:
+                    return json.dumps({"error": f"Item {i}: invalid {_df} '{item[_df]}' (use YYYY-MM-DD)."})
+
     app   = get_app()
     proj  = get_proj(app)
     mpd   = _get_mpd(proj)
@@ -2189,6 +2227,13 @@ def set_calendar_exception(
     if calendar_name not in valid_cals:
         return json.dumps({"error": f"Calendar '{calendar_name}' not found. Available: {valid_cals}"})
 
+    # Exceptions.Add creates a NON-WORKING (holiday) exception. Applying custom
+    # working shifts is not implemented, so reject working=true rather than
+    # report a state the calendar does not actually have.
+    if working:
+        return json.dumps({"error": "working=true exceptions are not supported by this tool; "
+                                    "it creates non-working (holiday) exceptions. Use working=false."})
+
     try:
         # Use the Calendar.Exceptions collection for date-range exceptions
         cal = None
@@ -2211,7 +2256,7 @@ def set_calendar_exception(
         "exception": name,
         "start":    start,
         "finish":   finish,
-        "working":  working,
+        "working":  False,
     }, indent=2)
 
 
@@ -3125,6 +3170,7 @@ def bulk_assign_resources(assignments_json: str) -> str:
         app.CalculateProject()
         app.Calculation = -1
 
+    app.FileSave()  # persist, consistent with the other mutating tools
     return json.dumps({
         "assigned":          assigned,
         "errors":            errors,
@@ -3165,6 +3211,7 @@ def remove_resource_assignment(task_unique_id: int, resource_name: str) -> str:
     if removed == 0:
         return json.dumps({"error": f"Resource '{resource_name}' not assigned to task '{t.Name}'. Current: {t.ResourceNames}"})
 
+    app.FileSave()  # persist, consistent with the other mutating tools
     return json.dumps({
         "status":             "removed",
         "task_name":          t.Name,
@@ -3214,6 +3261,8 @@ def update_resource(resource_name: str, new_name: str = "", max_units: float = -
         resource.CostPerUse = cost_per_use
         changed.append("cost_per_use")
 
+    if changed:
+        app.FileSave()  # persist, consistent with the other mutating tools
     return json.dumps({
         "status":  "updated",
         "name":    resource.Name,
@@ -3266,6 +3315,7 @@ def move_task(unique_id: int, after_unique_id: int) -> str:
     moved = _find_task(proj, unique_id)
     new_id = moved.ID if moved else None
 
+    app.FileSave()  # persist, consistent with the other mutating tools
     return json.dumps({
         "status":    "moved",
         "unique_id": unique_id,
@@ -3384,6 +3434,7 @@ def copy_task_structure(source_unique_id: int, copies: int = 1) -> str:
                     "name":      t.Name,
                 })
 
+    app.FileSave()  # persist, consistent with the other mutating tools
     return json.dumps({
         "status":       "copied",
         "source_name":  source.Name,
@@ -3446,6 +3497,8 @@ def cross_project_link(source_project: str, source_unique_id: int, target_projec
         "source":  {"project": src_proj.Name, "task": src_task.Name, "unique_id": source_unique_id},
         "target":  {"project": tgt_proj.Name, "task": tgt_task.Name, "unique_id": target_unique_id},
         "link_type": link_type,
+        "saved":   False,
+        "note":    "Cross-project edit applied in memory on the target project; save that project to persist (auto-save is skipped here to avoid saving the wrong active project).",
     }, indent=2)
 
 
@@ -3847,6 +3900,7 @@ def insert_subproject(file_path: str, after_unique_id: int = 0) -> str:
 
     count_after = proj.Tasks.Count
 
+    app.FileSave()  # persist, consistent with the other mutating tools
     return json.dumps({
         "status":           "inserted",
         "file_path":        file_path,
@@ -3996,27 +4050,31 @@ def delete_resource(resource_name: str, confirm: bool = False) -> str:
     if target is None:
         return json.dumps({"error": f"Resource '{resource_name}' not found."})
 
-    # Clear assignments first
+    # Clear assignments first. Report (don't swallow) failures — a partially
+    # cleared resource that then deletes shouldn't look fully clean to the client.
     assignments_cleared = 0
-    # Iterate in reverse to avoid index shifting
+    assignment_errors = []
     for i in range(target.Assignments.Count, 0, -1):
         try:
             target.Assignments(i).Delete()
             assignments_cleared += 1
-        except Exception:
-            pass
+        except Exception as e:
+            assignment_errors.append(str(e))
 
     name = target.Name
     try:
         target.Delete()
     except Exception as e:
-        return json.dumps({"error": f"Failed to delete resource: {e}"})
+        return json.dumps({"error": f"Failed to delete resource: {e}",
+                           "assignments_cleared": assignments_cleared,
+                           "assignment_errors": assignment_errors})
 
     app.FileSave()
     return json.dumps({
         "status":              "deleted",
         "name":                name,
         "assignments_cleared": assignments_cleared,
+        "assignment_errors":   assignment_errors,
     }, indent=2)
 
 
