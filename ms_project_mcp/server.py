@@ -130,6 +130,16 @@ def get_proj(app):
         for p in app.Projects:
             try:
                 if p is not None and p.Name == _TARGET_PROJECT:
+                    # Make the target the ACTIVE project so app-level operations
+                    # (FileSave, SelectRow/EditDelete, EditCut/Paste) act on the
+                    # intended project, not whatever window has UI focus. Activating
+                    # only when needed avoids stealing focus on every call.
+                    try:
+                        active = app.ActiveProject
+                        if active is None or active.Name != p.Name:
+                            p.Activate()
+                    except Exception:
+                        pass
                     return p
             except Exception:
                 continue
@@ -2790,11 +2800,13 @@ def get_resource_workload(resource_name: str, start_date: str = "", end_date: st
 
 
 @mcp.tool()
-def level_resources() -> str:
+def level_resources(confirm: bool = False) -> str:
     """
     Run MS Project's built-in resource leveling algorithm.
-    WARNING: This may shift task dates. Save a baseline first if tracking variance.
+    WARNING: This may shift task dates and is saved. Requires confirm=true in safe mode.
+    Save a baseline first if tracking variance.
     """
+    _require_confirm(confirm, "level_resources (may shift task dates)")
     app  = get_app()
     proj = get_proj(app)
 
@@ -4253,15 +4265,17 @@ def health_check() -> str:
 
 
 @mcp.tool()
-def update_project(complete_through: str, set_0_or_100: bool = False) -> str:
+def update_project(complete_through: str, set_0_or_100: bool = False, confirm: bool = False) -> str:
     """
     Mark all tasks complete through a given date (the weekly PMO ritual).
     Tasks that should have finished by the date get their % complete updated.
+    Mass mutation that is saved — requires confirm=true in safe mode.
 
     Args:
         complete_through: Date as YYYY-MM-DD — tasks scheduled through this date are updated.
         set_0_or_100:     If True, tasks are set to 0% or 100% only (no partial). Default False.
     """
+    _require_confirm(confirm, "update_project (mass progress update through a date)")
     app  = get_app()
     proj = get_proj(app)
     dt   = _parse_date(complete_through)
@@ -4292,14 +4306,16 @@ def update_project(complete_through: str, set_0_or_100: bool = False) -> str:
 
 
 @mcp.tool()
-def reschedule_incomplete_work(reschedule_from: str = "") -> str:
+def reschedule_incomplete_work(reschedule_from: str = "", confirm: bool = False) -> str:
     """
     Move remaining work on incomplete tasks to start after the given date
-    (or the project status date if not specified).
+    (or the project status date if not specified). Mass mutation that is saved —
+    requires confirm=true in safe mode.
 
     Args:
         reschedule_from: Date as YYYY-MM-DD. Empty = use project status date.
     """
+    _require_confirm(confirm, "reschedule_incomplete_work (shifts remaining work)")
     app  = get_app()
     proj = get_proj(app)
 
@@ -4331,13 +4347,15 @@ def reschedule_incomplete_work(reschedule_from: str = "") -> str:
 
 
 @mcp.tool()
-def delete_calendar(calendar_name: str) -> str:
+def delete_calendar(calendar_name: str, confirm: bool = False) -> str:
     """
     Delete a base calendar by name. Cannot delete the project calendar.
+    Irreversible after save — requires confirm=true in safe mode.
 
     Args:
         calendar_name: Name of the calendar to delete.
     """
+    _require_confirm(confirm, "delete_calendar (%s)" % calendar_name)
     app  = get_app()
     proj = get_proj(app)
 
@@ -4358,14 +4376,16 @@ def delete_calendar(calendar_name: str) -> str:
 
 
 @mcp.tool()
-def delete_calendar_exception(calendar_name: str, exception_name: str) -> str:
+def delete_calendar_exception(calendar_name: str, exception_name: str, confirm: bool = False) -> str:
     """
     Remove a specific exception (holiday/non-working day) from a calendar.
+    Irreversible after save — requires confirm=true in safe mode.
 
     Args:
         calendar_name:  Name of the base calendar.
         exception_name: Name of the exception to remove.
     """
+    _require_confirm(confirm, "delete_calendar_exception (%s)" % exception_name)
     app  = get_app()
     proj = get_proj(app)
 
@@ -5393,8 +5413,11 @@ def what_if_delay(
 
 def main():
     """Console-script / module entry point. Starts the MCP server over stdio."""
-    print("Starting MS Project MCP Server...")
-    print("MS Project must be running with a file open before using tools.")
+    # stdout is reserved for the MCP stdio JSON-RPC stream; banners MUST go to
+    # stderr or they corrupt the protocol.
+    import sys
+    print("Starting MS Project MCP Server...", file=sys.stderr)
+    print("MS Project must be running with a file open before using tools.", file=sys.stderr)
     mcp.run()
 
 
