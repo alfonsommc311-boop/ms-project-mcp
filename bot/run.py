@@ -41,22 +41,38 @@ def build_channels(cfg: Config, agent: ProjectAgent) -> list[Channel]:
             EmailChannel(
                 agent,
                 cfg.email_imap_host,
+                cfg.email_imap_port,
                 cfg.email_smtp_host,
+                cfg.email_smtp_port,
                 cfg.email_user,
                 cfg.email_password,
                 cfg.email_allowed,
+                cfg.email_poll_seconds,
             )
         )
 
     if cfg.slack_bot_token and cfg.slack_app_token:
         from .channels.slack_channel import SlackChannel
 
-        channels.append(SlackChannel(agent, cfg.slack_bot_token, cfg.slack_app_token))
+        channels.append(
+            SlackChannel(agent, cfg.slack_bot_token, cfg.slack_app_token, cfg.slack_allowed)
+        )
 
-    if cfg.whatsapp_token and cfg.whatsapp_phone_id:
+    if cfg.whatsapp_token and cfg.whatsapp_phone_id and cfg.whatsapp_verify_token:
         from .channels.whatsapp_channel import WhatsAppChannel
 
-        channels.append(WhatsAppChannel(agent, cfg.whatsapp_token, cfg.whatsapp_phone_id))
+        channels.append(
+            WhatsAppChannel(
+                agent,
+                cfg.whatsapp_token,
+                cfg.whatsapp_phone_id,
+                cfg.whatsapp_verify_token,
+                cfg.whatsapp_host,
+                cfg.whatsapp_port,
+                cfg.whatsapp_graph_version,
+                cfg.whatsapp_allowed,
+            )
+        )
 
     return channels
 

@@ -1,7 +1,7 @@
 # Bot de mensajería para MS Project
 
 Un bot conversacional que te deja consultar y modificar tu proyecto de Microsoft
-Project **por chat** (Telegram, y de forma extensible Email, Slack y WhatsApp).
+Project **por chat** (Telegram, Email, Slack y WhatsApp).
 Entiende lenguaje natural gracias a **Claude (Anthropic)** y ejecuta las acciones
 a través del servidor MCP de este repositorio (`server.py`, 99 herramientas).
 
@@ -70,18 +70,26 @@ Comandos: `/start` (ayuda), `/reset` (reinicia la conversación).
 | `mcp_link.py` | Lanza `server.py` por stdio y expone sus 99 herramientas. |
 | `agent.py` | El cerebro: bucle de tool-use con Claude. |
 | `run.py` | Punto de entrada; arranca MCP + canales. |
-| `channels/telegram_channel.py` | Canal Telegram (**funcional**). |
-| `channels/email_channel.py` | Canal Email (esqueleto). |
-| `channels/slack_channel.py` | Canal Slack (esqueleto). |
-| `channels/whatsapp_channel.py` | Canal WhatsApp (esqueleto). |
+| `channels/telegram_channel.py` | Canal Telegram. |
+| `channels/email_channel.py` | Canal Email (IMAP/SMTP, stdlib). |
+| `channels/slack_channel.py` | Canal Slack (Socket Mode). |
+| `channels/whatsapp_channel.py` | Canal WhatsApp (Cloud API de Meta). |
 
-## Añadir más canales
+## Canales disponibles
 
-Cada canal hereda de `channels/base.Channel` y sólo tiene que llamar a
-`await self.agent.handle(conversation_id, texto)` y devolver la respuesta por su
-medio. Los esqueletos de Email, Slack y WhatsApp incluyen los pasos concretos
-para completarlos. Se activan automáticamente en `run.py` cuando defines sus
-variables de entorno.
+Todos los canales funcionan y se activan automáticamente en `run.py` cuando
+defines sus variables de entorno. Puedes tener varios a la vez.
+
+| Canal | Cómo funciona | Dependencias |
+|---|---|---|
+| **Telegram** | Polling; gratis vía @BotFather. | `python-telegram-bot` |
+| **Email** | Sondeo IMAP + respuesta SMTP. Usa contraseña de aplicación. | stdlib (ninguna) |
+| **Slack** | Socket Mode (sin URL pública). | `slack_bolt` |
+| **WhatsApp** | Webhook (Cloud API de Meta). Requiere HTTPS público. | `fastapi`, `uvicorn` |
+
+Para añadir un canal nuevo, hereda de `channels/base.Channel`, llama a
+`await self.agent.handle(conversation_id, texto)` y devuelve la respuesta por tu
+medio.
 
 ## Seguridad
 

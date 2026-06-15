@@ -46,22 +46,45 @@ class Config:
         default_factory=lambda: _split_ids(os.environ.get("TELEGRAM_ALLOWED_IDS"))
     )
 
-    # --- Canal: Email (esqueleto) ---
+    # --- Canal: Email ---
     email_imap_host: str = field(default_factory=lambda: os.environ.get("EMAIL_IMAP_HOST", ""))
+    email_imap_port: int = field(default_factory=lambda: int(os.environ.get("EMAIL_IMAP_PORT", "993")))
     email_smtp_host: str = field(default_factory=lambda: os.environ.get("EMAIL_SMTP_HOST", ""))
+    email_smtp_port: int = field(default_factory=lambda: int(os.environ.get("EMAIL_SMTP_PORT", "465")))
     email_user: str = field(default_factory=lambda: os.environ.get("EMAIL_USER", ""))
     email_password: str = field(default_factory=lambda: os.environ.get("EMAIL_PASSWORD", ""))
+    email_poll_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("EMAIL_POLL_SECONDS", "30"))
+    )
+    # Lista blanca de remitentes (emails). Vacía => rechaza a todos.
     email_allowed: set[str] = field(
-        default_factory=lambda: _split_ids(os.environ.get("EMAIL_ALLOWED_SENDERS"))
+        default_factory=lambda: {s.lower() for s in _split_ids(os.environ.get("EMAIL_ALLOWED_SENDERS"))}
     )
 
-    # --- Canal: Slack (esqueleto) ---
+    # --- Canal: Slack ---
     slack_bot_token: str = field(default_factory=lambda: os.environ.get("SLACK_BOT_TOKEN", ""))
     slack_app_token: str = field(default_factory=lambda: os.environ.get("SLACK_APP_TOKEN", ""))
+    # Lista blanca de user IDs de Slack. Vacía => permite a todo el workspace.
+    slack_allowed: set[str] = field(
+        default_factory=lambda: _split_ids(os.environ.get("SLACK_ALLOWED_USERS"))
+    )
 
-    # --- Canal: WhatsApp (esqueleto) ---
+    # --- Canal: WhatsApp ---
     whatsapp_token: str = field(default_factory=lambda: os.environ.get("WHATSAPP_TOKEN", ""))
     whatsapp_phone_id: str = field(default_factory=lambda: os.environ.get("WHATSAPP_PHONE_ID", ""))
+    # Token que tú eliges y configuras en el panel de Meta para verificar el webhook.
+    whatsapp_verify_token: str = field(
+        default_factory=lambda: os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
+    )
+    whatsapp_host: str = field(default_factory=lambda: os.environ.get("WHATSAPP_HOST", "0.0.0.0"))
+    whatsapp_port: int = field(default_factory=lambda: int(os.environ.get("WHATSAPP_PORT", "8080")))
+    whatsapp_graph_version: str = field(
+        default_factory=lambda: os.environ.get("WHATSAPP_GRAPH_VERSION", "v20.0")
+    )
+    # Lista blanca de números (formato internacional sin '+'). Vacía => rechaza a todos.
+    whatsapp_allowed: set[str] = field(
+        default_factory=lambda: _split_ids(os.environ.get("WHATSAPP_ALLOWED_NUMBERS"))
+    )
 
     def mcp_command(self) -> list[str]:
         """Devuelve el comando + args para lanzar el servidor MCP por stdio."""
