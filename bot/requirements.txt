@@ -1,0 +1,21 @@
+# Dependencias del bot de mensajería.
+# Instala con:  pip install -r bot/requirements.txt
+
+# Cerebro (Claude / Anthropic) + cliente MCP
+anthropic>=0.49.0
+mcp>=1.0.0
+
+# Carga de variables desde .env (opcional pero recomendado)
+python-dotenv>=1.0.0
+
+# Canal Telegram
+python-telegram-bot>=21.0
+
+# El canal Email usa sólo la stdlib (imaplib/smtplib): no requiere nada extra.
+
+# --- Canales opcionales (instala sólo los que vayas a usar) ---
+# Slack (Socket Mode)
+# slack_bolt>=1.18.0
+# WhatsApp (webhook con la Cloud API de Meta); httpx ya viene con anthropic
+# fastapi>=0.110.0
+# uvicorn>=0.29.0
