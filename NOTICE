@@ -1,0 +1,28 @@
+MS Project MCP Server
+=====================
+
+Original work:
+  Copyright (c) 2026 Ibrahim Elsahafy
+  Licensed under the MIT License (see LICENSE).
+
+This distribution additionally includes modifications, hardening, packaging,
+documentation and tooling contributed by the maintainers of this fork. Those
+contributions are provided under the same MIT License, EXCEPT where a separate
+commercial license agreement (see EULA.md) has been entered into, in which case
+that agreement governs the licensee's use of this distribution (warranty,
+support, updates and indemnification are provided only under the commercial
+license; the MIT version is provided "AS IS").
+
+Trademarks
+----------
+"Microsoft", "Microsoft Project", "Microsoft 365" and related names, logos and
+marks are trademarks of Microsoft Corporation. This product is an independent
+integration that automates a user-provided, separately licensed installation of
+Microsoft Project via COM automation. It is NOT affiliated with, endorsed by, or
+sponsored by Microsoft Corporation. References to "Microsoft Project" are
+nominative and used only to identify compatibility.
+
+Third-party dependencies (see their respective licenses):
+  - mcp (Model Context Protocol SDK)
+  - pywin32
+  - python-dateutil

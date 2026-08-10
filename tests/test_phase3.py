@@ -4,7 +4,7 @@ import json
 import importlib.util
 import os
 
-_server_path = os.path.join(os.path.dirname(__file__), "..", "server.py")
+_server_path = os.path.join(os.path.dirname(__file__), "..", "ms_project_mcp", "server.py")
 spec = importlib.util.spec_from_file_location("server", _server_path)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)

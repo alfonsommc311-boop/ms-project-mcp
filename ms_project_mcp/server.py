@@ -6,11 +6,79 @@ Run:     python server.py
 Register in claude_desktop_config.json (see bottom of file).
 """
 
+import os
 import json
 import datetime
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("MS Project")
+
+# ---------------------------------------------------------------------------
+# Hardening helpers
+# ---------------------------------------------------------------------------
+
+# Safe mode (default ON): destructive/irreversible tools require confirm=true.
+# Disable per deployment with MSPROJECT_MCP_SAFE_MODE=0.
+SAFE_MODE = str(os.environ.get("MSPROJECT_MCP_SAFE_MODE", "1")).strip().lower() \
+    not in ("0", "false", "no", "off")
+
+
+def _require_confirm(confirm, action):
+    """Gate a destructive action. In safe mode it must be called with confirm=True."""
+    if SAFE_MODE and not confirm:
+        raise RuntimeError(
+            "Safe mode: '%s' is destructive/irreversible and requires confirm=true. "
+            "Re-issue the call with confirm=true once you're sure "
+            "(or set env MSPROJECT_MCP_SAFE_MODE=0 to disable safe mode)." % action
+        )
+
+
+def _as_bool(v):
+    """Robust truthiness for JSON/string inputs: 'false'/'0'/'no'/'off'/'' -> False
+    (plain bool(value) is wrong because bool('false') is True)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y", "si", "sí", "on")
+    return bool(v)
+
+
+def _same_project(a, b):
+    """Stable identity match between two project objects. Prefer FullName (full
+    path, unique for saved files); fall back to Name for unsaved projects."""
+    if a is None or b is None:
+        return False
+    try:
+        fa, fb = a.FullName, b.FullName
+        if fa and fb:
+            return fa == fb
+    except Exception:
+        pass
+    try:
+        return a.Name == b.Name
+    except Exception:
+        return False
+
+
+def _save_if_active(app, proj):
+    """Save ONLY when the mutated target project is the active one.
+
+    MS Project's FileSave targets the ACTIVE project, but this server uses a
+    deterministic target-project model (proj may not be the UI-active project).
+    Saving when proj != active would write the wrong file, so skip the save then
+    (the change still persists in memory; the caller can save that project).
+    FileSave failures are NOT swallowed — they propagate so callers don't report
+    a successful mutation as saved when it wasn't. Returns True if it saved."""
+    try:
+        active = app.ActiveProject
+    except Exception:
+        active = None
+    if not _same_project(proj, active):
+        return False
+    app.FileSave()  # let read-only/disk/prompt errors propagate to the caller
+    return True
 
 # ---------------------------------------------------------------------------
 # COM helpers
@@ -19,6 +87,14 @@ mcp = FastMCP("MS Project")
 def get_app(require_project=True):
     """Get running MS Project instance. Raises if not running."""
     import win32com.client
+    # Ensure COM is initialized on THIS thread. FastMCP may dispatch tools on
+    # worker threads; without CoInitialize, GetActiveObject can fail intermittently
+    # ("CoInitialize has not been called"). Idempotent/cheap; ignore if already init.
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
     try:
         app = win32com.client.GetActiveObject("MSProject.Application")
     except Exception:
@@ -32,7 +108,42 @@ def get_app(require_project=True):
     return app
 
 
+# Deterministic target project. Tools that create/open/switch a project record
+# its name here so later calls operate on the intended project regardless of
+# which MS Project window is frontmost — app.ActiveProject follows UI focus and
+# is unreliable for automation (caused tasks to land in the wrong project).
+# Falls back to ActiveProject when unset or the target was closed.
+_TARGET_PROJECT = None
+
+
+def _set_target_project(proj):
+    global _TARGET_PROJECT
+    try:
+        _TARGET_PROJECT = proj.Name
+    except Exception:
+        _TARGET_PROJECT = None
+
+
 def get_proj(app):
+    global _TARGET_PROJECT
+    if _TARGET_PROJECT:
+        for p in app.Projects:
+            try:
+                if p is not None and p.Name == _TARGET_PROJECT:
+                    # Make the target the ACTIVE project so app-level operations
+                    # (FileSave, SelectRow/EditDelete, EditCut/Paste) act on the
+                    # intended project, not whatever window has UI focus. Activating
+                    # only when needed avoids stealing focus on every call.
+                    try:
+                        active = app.ActiveProject
+                        if active is None or active.Name != p.Name:
+                            p.Activate()
+                    except Exception:
+                        pass
+                    return p
+            except Exception:
+                continue
+        _TARGET_PROJECT = None  # target was closed → fall back
     return app.ActiveProject
 
 
@@ -42,6 +153,13 @@ def _get_mpd(proj):
         return proj.MinutesPerDay
     except Exception:
         return 480
+
+
+# MS Project task-link type constants (pjTaskLinkType) — locale-independent.
+# Setting links via TaskDependencies.Add avoids the localized Predecessors text
+# parser, which rejects English codes in non-English Project (e.g. Spanish needs
+# "3FC" instead of "3FS"). See ROADMAP_COMERCIAL.md, Fase 1.
+PJ_LINK_TYPE = {"FF": 0, "FS": 1, "SF": 2, "SS": 3}
 
 
 def _parse_date(s):
@@ -201,6 +319,7 @@ def open_project(file_path: str) -> str:
 
     app.FileOpen(file_path)
     proj = app.ActiveProject
+    _set_target_project(proj)
     return json.dumps({
         "status":     "opened",
         "name":       proj.Name,
@@ -233,6 +352,7 @@ def new_project(title: str = "New Project", start: str = "") -> str:
     proj.Title = title
     if start:
         proj.ProjectStart = _parse_date(start)
+    _set_target_project(proj)
 
     return json.dumps({
         "status": "created",
@@ -332,11 +452,14 @@ def save_project() -> str:
 
 
 @mcp.tool()
-def save_project_as(file_path: str, format: str = "mpp") -> str:
+def save_project_as(file_path: str, format: str = "mpp", confirm: bool = False) -> str:
     """
     Save the active project to a new path.
     format: 'mpp' (default), 'xml', 'csv'
+    Overwriting an EXISTING file requires confirm=true in safe mode.
     """
+    if os.path.exists(file_path):
+        _require_confirm(confirm, "save_project_as (overwrite existing %s)" % file_path)
     fmt_map = {"mpp": 0, "xml": 22, "csv": 23}
     fmt_id  = fmt_map.get(format.lower(), 0)
     app     = get_app()
@@ -345,10 +468,23 @@ def save_project_as(file_path: str, format: str = "mpp") -> str:
 
 
 @mcp.tool()
-def close_project(save: bool = False) -> str:
-    """Close the active project. Set save=True to save before closing."""
+def close_project(save: bool = False, confirm: bool = False) -> str:
+    """Close the active project. Set save=True to save before closing.
+    Closing with save=False DISCARDS unsaved changes and requires confirm=true in safe mode."""
+    global _TARGET_PROJECT
+    if not save:
+        _require_confirm(confirm, "close_project (discard unsaved changes)")
     app = get_app()
+    proj = get_proj(app)
+    closed_name = None
+    try:
+        closed_name = proj.Name
+        proj.Activate()  # close the intended (target) project, not just the frontmost window
+    except Exception:
+        pass
     app.FileClose(Save=1 if save else 0)
+    if closed_name and closed_name == _TARGET_PROJECT:
+        _TARGET_PROJECT = None
     return "Project closed."
 
 
@@ -524,6 +660,13 @@ def update_task(
     proj = get_proj(app)
     mpd  = _get_mpd(proj)
 
+    # Validate ranged inputs BEFORE mutating anything — COM writes are immediate,
+    # so a late range error would otherwise leave the task partially changed.
+    if percent_complete >= 0 and percent_complete > 100:
+        return json.dumps({"error": "percent_complete must be 0-100."})
+    if priority >= 0 and priority > 1000:
+        return json.dumps({"error": "priority must be 0-1000."})
+
     for t in proj.Tasks:
         if t is None or t.UniqueID != unique_id:
             continue
@@ -614,6 +757,22 @@ def bulk_update_tasks(updates_json: str) -> str:
             Example: '[{"unique_id": 42, "rag": "Red", "percent_complete": 50}]'
     """
     items = json.loads(updates_json)
+    if not isinstance(items, list):
+        return json.dumps({"error": "updates_json must be a JSON list."})
+    # Pre-validate EVERY item before mutating, so a bad item can't leave partial updates.
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or "unique_id" not in item:
+            return json.dumps({"error": f"Item {i}: 'unique_id' is required."})
+        for _df in ("start", "finish"):
+            if item.get(_df):
+                try:
+                    _parse_date(item[_df])
+                except Exception:
+                    return json.dumps({"error": f"Item {i}: invalid {_df} '{item[_df]}' (use YYYY-MM-DD)."})
+        _pc = item.get("percent_complete")
+        if isinstance(_pc, (int, float)) and (_pc < 0 or _pc > 100):
+            return json.dumps({"error": f"Item {i}: percent_complete must be 0-100."})
+
     app   = get_app()
     proj  = get_proj(app)
     mpd   = _get_mpd(proj)
@@ -699,7 +858,15 @@ def add_task(
     app.Calculation = 0
 
     try:
-        task = proj.Tasks.Add(name)
+        # Honor after_unique_id: insert right after that task (MS Project inserts
+        # at the given sequential ID). 0 (or unset) -> append at end.
+        if after_unique_id and after_unique_id > 0:
+            _after = _find_task(proj, after_unique_id)
+            if _after is None:
+                return json.dumps({"error": f"after_unique_id {after_unique_id} not found."})
+            task = proj.Tasks.Add(name, _after.ID + 1)
+        else:
+            task = proj.Tasks.Add(name)
         task.OutlineLevel  = outline_level
         task.Milestone     = milestone
         if milestone:
@@ -747,6 +914,20 @@ def bulk_add_tasks(tasks_json: str) -> str:
                        {"name": "Task A", "outline_level": 2, "start": "2026-04-01"}]'
     """
     tasks = json.loads(tasks_json)
+    if not isinstance(tasks, list):
+        return json.dumps({"error": "tasks_json must be a JSON list."})
+    # Pre-validate EVERY item before mutating, so a bad item (missing name / bad
+    # date) can't leave the project with partial inserts.
+    for i, item in enumerate(tasks):
+        if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+            return json.dumps({"error": f"Item {i}: 'name' is required."})
+        for _df in ("start", "finish"):
+            if item.get(_df):
+                try:
+                    _parse_date(item[_df])
+                except Exception:
+                    return json.dumps({"error": f"Item {i}: invalid {_df} '{item[_df]}' (use YYYY-MM-DD)."})
+
     app   = get_app()
     proj  = get_proj(app)
     mpd   = _get_mpd(proj)
@@ -800,8 +981,9 @@ def bulk_add_tasks(tasks_json: str) -> str:
 
 
 @mcp.tool()
-def delete_task(unique_id: int) -> str:
-    """Delete a task by its UniqueID. This cannot be undone after save."""
+def delete_task(unique_id: int, confirm: bool = False) -> str:
+    """Delete a task by its UniqueID. Irreversible after save — requires confirm=true in safe mode."""
+    _require_confirm(confirm, "delete_task (unique_id=%s)" % unique_id)
     app  = get_app()
     proj = get_proj(app)
 
@@ -1020,40 +1202,37 @@ def add_predecessor(
     app  = get_app()
     proj = get_proj(app)
 
-    uid_to_id = {t.UniqueID: t.ID for t in proj.Tasks if t is not None}
+    lt = str(link_type or "FS").upper().strip()
+    if lt not in PJ_LINK_TYPE:
+        return json.dumps({"error": f"Invalid link_type '{link_type}'. Use FS, SS, FF, or SF."})
 
-    if successor_unique_id not in uid_to_id:
-        return json.dumps({"error": f"Successor UniqueID {successor_unique_id} not found."})
-    if predecessor_unique_id not in uid_to_id:
+    pred_task = _find_task(proj, predecessor_unique_id)
+    succ_task = _find_task(proj, successor_unique_id)
+    if pred_task is None:
         return json.dumps({"error": f"Predecessor UniqueID {predecessor_unique_id} not found."})
+    if succ_task is None:
+        return json.dumps({"error": f"Successor UniqueID {successor_unique_id} not found."})
 
-    pred_id = uid_to_id[predecessor_unique_id]
-    succ_task = None
-    for t in proj.Tasks:
-        if t is not None and t.UniqueID == successor_unique_id:
-            succ_task = t
-            break
-
-    lag_str = ""
-    if lag_days > 0:
-        lag_str = f"+{lag_days}d"
-    elif lag_days < 0:
-        lag_str = f"{lag_days}d"
-
-    existing = succ_task.Predecessors.strip()
-    new_pred  = f"{pred_id}{link_type}{lag_str}"
-
-    if existing:
-        succ_task.Predecessors = existing + "," + new_pred
-    else:
-        succ_task.Predecessors = new_pred
+    # Use the COM object model (locale-independent) instead of the localized
+    # Predecessors text field, which rejects English codes in non-English Project.
+    try:
+        # Add() with only the predecessor creates a Finish-to-Start link; the
+        # .Type property (enum 0=FF,1=FS,2=SF,3=SS) sets SS/FF/SF. This object-model
+        # path is locale-independent — no "3FS" text parse that ES Project rejects.
+        dep = succ_task.TaskDependencies.Add(pred_task)
+        dep.Type = PJ_LINK_TYPE[lt]
+        if lag_days:
+            dep.Lag = int(round(lag_days * _get_mpd(proj)))
+    except Exception as e:
+        return json.dumps({"error": f"Could not link tasks: {e}"})
 
     app.FileSave()
     return json.dumps({
         "status":       "linked",
         "successor":    successor_unique_id,
         "predecessor":  predecessor_unique_id,
-        "link":         new_pred,
+        "link_type":    lt,
+        "lag_days":     lag_days,
         "predecessors": succ_task.Predecessors,
     }, indent=2)
 
@@ -1072,8 +1251,8 @@ def bulk_add_predecessors(links_json: str) -> str:
     app   = get_app()
     proj  = get_proj(app)
 
-    uid_to_id = {t.UniqueID: t.ID for t in proj.Tasks if t is not None}
     uid_to_task = {t.UniqueID: t for t in proj.Tasks if t is not None}
+    mpd = _get_mpd(proj)
 
     linked = 0
     errors = []
@@ -1081,34 +1260,32 @@ def bulk_add_predecessors(links_json: str) -> str:
     for link in links:
         succ_uid = link["successor_unique_id"]
         pred_uid = link["predecessor_unique_id"]
-        lt       = link.get("link_type", "FS")
+        lt       = str(link.get("link_type", "FS")).upper().strip()
         lag      = link.get("lag_days", 0)
 
-        if succ_uid not in uid_to_id:
+        if lt not in PJ_LINK_TYPE:
+            errors.append({"successor_unique_id": succ_uid, "error": f"invalid link_type '{lt}'"})
+            continue
+
+        succ_task = uid_to_task.get(succ_uid)
+        pred_task = uid_to_task.get(pred_uid)
+        if succ_task is None:
             errors.append({"successor_unique_id": succ_uid, "error": "not found"})
             continue
-        if pred_uid not in uid_to_id:
+        if pred_task is None:
             errors.append({"predecessor_unique_id": pred_uid, "error": "not found"})
             continue
 
-        pred_id   = uid_to_id[pred_uid]
-        succ_task = uid_to_task[succ_uid]
-
-        lag_str = ""
-        if lag > 0:
-            lag_str = f"+{lag}d"
-        elif lag < 0:
-            lag_str = f"{lag}d"
-
-        new_pred = f"{pred_id}{lt}{lag_str}"
-        existing = succ_task.Predecessors.strip()
-
-        if existing:
-            succ_task.Predecessors = existing + "," + new_pred
-        else:
-            succ_task.Predecessors = new_pred
-
-        linked += 1
+        # Locale-independent link via the COM object model (see add_predecessor).
+        # Per-link try/except → partial success instead of all-or-nothing abort.
+        try:
+            dep = succ_task.TaskDependencies.Add(pred_task)
+            dep.Type = PJ_LINK_TYPE[lt]
+            if lag:
+                dep.Lag = int(round(lag * mpd))
+            linked += 1
+        except Exception as e:
+            errors.append({"successor_unique_id": succ_uid, "predecessor_unique_id": pred_uid, "error": str(e)})
 
     app.FileSave()
     return json.dumps({
@@ -1295,24 +1472,25 @@ def assign_resource(task_unique_id: int, resource_name: str, units: float = 1.0)
     if task is None:
         return json.dumps({"error": f"Task UniqueID {task_unique_id} not found."})
 
-    # Check if resource exists, create if not
-    res_exists = False
+    # Find or create the resource (capture the object for its ID).
+    res = None
     for r in proj.Resources:
         if r is not None and r.Name.lower() == resource_name.lower():
-            res_exists = True
+            res = r
             break
-    if not res_exists:
-        proj.Resources.Add(resource_name)
+    if res is None:
+        res = proj.Resources.Add(resource_name)
 
-    # Append to ResourceNames (handles existing assignments)
-    existing = (task.ResourceNames or "").strip()
-    if existing:
-        # Check if already assigned
-        existing_names = [n.strip().lower() for n in existing.split(",")]
-        if resource_name.lower() not in existing_names:
-            task.ResourceNames = existing + "," + resource_name
-    else:
-        task.ResourceNames = resource_name
+    # Assign via the Assignments object model and set Units explicitly.
+    # Units = % allocation for work resources, or QUANTITY for material resources
+    # (the localized ResourceNames text path silently dropped material quantities).
+    already = any(
+        a is not None and (a.ResourceName or "").lower() == resource_name.lower()
+        for a in task.Assignments
+    )
+    if not already:
+        a = task.Assignments.Add(task.ID, res.ID)
+        a.Units = units
 
     app.FileSave()
     return json.dumps({
@@ -1320,6 +1498,7 @@ def assign_resource(task_unique_id: int, resource_name: str, units: float = 1.0)
         "task_unique_id": task_unique_id,
         "task_name":      task.Name,
         "resource_name":  resource_name,
+        "units":          units,
         "resource_names": task.ResourceNames,
     }, indent=2)
 
@@ -1640,9 +1819,9 @@ def save_baseline(baseline_number: int = 0, all_tasks: bool = True) -> str:
 
 
 @mcp.tool()
-def clear_baseline(baseline_number: int = 0, all_tasks: bool = True) -> str:
+def clear_baseline(baseline_number: int = 0, all_tasks: bool = True, confirm: bool = False) -> str:
     """
-    Clear a previously saved baseline.
+    Clear a previously saved baseline. Irreversible after save — requires confirm=true in safe mode.
 
     Args:
         baseline_number: 0 to 10. Default 0.
@@ -1650,6 +1829,7 @@ def clear_baseline(baseline_number: int = 0, all_tasks: bool = True) -> str:
     """
     if baseline_number < 0 or baseline_number > 10:
         return json.dumps({"error": "baseline_number must be 0-10."})
+    _require_confirm(confirm, "clear_baseline (baseline %s)" % baseline_number)
 
     app = get_app()
     app.BaselineClear(All=all_tasks, From=baseline_number)
@@ -1803,6 +1983,7 @@ def switch_project(name_or_index: str) -> str:
         if 1 <= idx <= app.Projects.Count:
             p = app.Projects(idx)
             p.Activate()
+            _set_target_project(p)
             return json.dumps({
                 "status":     "switched",
                 "name":       p.Name,
@@ -1832,6 +2013,7 @@ def switch_project(name_or_index: str) -> str:
         return json.dumps({"error": f"Multiple matches for '{name_or_index}': {names}. Be more specific."})
 
     _, p = matches[0]
+    _set_target_project(p)
     try:
         active = app.ActiveProject.Name
         if active == p.Name:
@@ -2091,6 +2273,13 @@ def set_calendar_exception(
     if calendar_name not in valid_cals:
         return json.dumps({"error": f"Calendar '{calendar_name}' not found. Available: {valid_cals}"})
 
+    # Exceptions.Add creates a NON-WORKING (holiday) exception. Applying custom
+    # working shifts is not implemented, so reject working=true rather than
+    # report a state the calendar does not actually have.
+    if _as_bool(working):
+        return json.dumps({"error": "working=true exceptions are not supported by this tool; "
+                                    "it creates non-working (holiday) exceptions. Use working=false."})
+
     try:
         # Use the Calendar.Exceptions collection for date-range exceptions
         cal = None
@@ -2113,7 +2302,7 @@ def set_calendar_exception(
         "exception": name,
         "start":    start,
         "finish":   finish,
-        "working":  working,
+        "working":  False,
     }, indent=2)
 
 
@@ -2233,7 +2422,7 @@ def update_custom_fields(unique_id: int, fields_json: str) -> str:
             if field_type == "date":
                 value = _parse_date(value)
             elif field_type == "flag":
-                value = bool(value)
+                value = _as_bool(value)  # 'false'/'0'/'no' -> False (bool('false') would be True)
             elif field_type == "duration":
                 value = float(value) * mpd
             elif field_type == "number":
@@ -2611,11 +2800,13 @@ def get_resource_workload(resource_name: str, start_date: str = "", end_date: st
 
 
 @mcp.tool()
-def level_resources() -> str:
+def level_resources(confirm: bool = False) -> str:
     """
     Run MS Project's built-in resource leveling algorithm.
-    WARNING: This may shift task dates. Save a baseline first if tracking variance.
+    WARNING: This may shift task dates and is saved. Requires confirm=true in safe mode.
+    Save a baseline first if tracking variance.
     """
+    _require_confirm(confirm, "level_resources (may shift task dates)")
     app  = get_app()
     proj = get_proj(app)
 
@@ -2983,11 +3174,7 @@ def bulk_assign_resources(assignments_json: str) -> str:
     app.Calculation = 0
     try:
         uid_map = {t.UniqueID: t for t in proj.Tasks if t is not None}
-        # Get existing resource names
-        existing_resources = set()
-        for r in proj.Resources:
-            if r is not None:
-                existing_resources.add(r.Name.lower())
+        res_map = {r.Name.lower(): r for r in proj.Resources if r is not None}
 
         assigned = 0
         errors = []
@@ -2996,32 +3183,42 @@ def bulk_assign_resources(assignments_json: str) -> str:
         for item in items:
             task_uid = item["task_unique_id"]
             res_name = item["resource_name"]
+            units    = item.get("units", 1.0)
 
             t = uid_map.get(task_uid)
             if t is None:
                 errors.append({"task_unique_id": task_uid, "error": "task not found"})
                 continue
 
-            # Create resource if needed
-            if res_name.lower() not in existing_resources:
-                proj.Resources.Add(res_name)
-                existing_resources.add(res_name.lower())
+            # Find or create the resource (capture the object for its ID).
+            res = res_map.get(res_name.lower())
+            if res is None:
+                res = proj.Resources.Add(res_name)
+                res_map[res_name.lower()] = res
                 created_resources.append(res_name)
 
-            # Append to ResourceNames
-            existing = (t.ResourceNames or "").strip()
-            if existing:
-                existing_names = [n.strip().lower() for n in existing.split(",")]
-                if res_name.lower() not in existing_names:
-                    t.ResourceNames = existing + "," + res_name
-            else:
-                t.ResourceNames = res_name
+            # Skip if already assigned to this task.
+            already = any(
+                a is not None and (a.ResourceName or "").lower() == res_name.lower()
+                for a in t.Assignments
+            )
+            if already:
+                continue
 
-            assigned += 1
+            # Assign via the object model. Units = % for work resources, or the
+            # QUANTITY for material resources — the old ResourceNames text path
+            # silently dropped material quantities (left them at 1).
+            try:
+                a = t.Assignments.Add(t.ID, res.ID)
+                a.Units = units
+                assigned += 1
+            except Exception as e:
+                errors.append({"task_unique_id": task_uid, "resource_name": res_name, "error": str(e)})
     finally:
         app.CalculateProject()
         app.Calculation = -1
 
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "assigned":          assigned,
         "errors":            errors,
@@ -3045,22 +3242,29 @@ def remove_resource_assignment(task_unique_id: int, resource_name: str) -> str:
     if t is None:
         return json.dumps({"error": f"Task UniqueID {task_unique_id} not found."})
 
-    existing = (t.ResourceNames or "").strip()
-    if not existing:
-        return json.dumps({"error": f"Task '{t.Name}' has no resources assigned."})
+    # Match on the assignment's clean ResourceName (no "[N]" quantity suffix that
+    # the old ResourceNames-string comparison choked on for materials) and Delete()
+    # the assignment object. Iterate in reverse to avoid index shifting.
+    removed = 0
+    for i in range(t.Assignments.Count, 0, -1):
+        a = t.Assignments(i)
+        try:
+            nm = (a.ResourceName or "")
+        except Exception:
+            nm = ""
+        if nm.lower() == resource_name.lower():
+            a.Delete()
+            removed += 1
 
-    names = [n.strip() for n in existing.split(",")]
-    filtered = [n for n in names if n.lower() != resource_name.lower()]
+    if removed == 0:
+        return json.dumps({"error": f"Resource '{resource_name}' not assigned to task '{t.Name}'. Current: {t.ResourceNames}"})
 
-    if len(filtered) == len(names):
-        return json.dumps({"error": f"Resource '{resource_name}' not assigned to task '{t.Name}'. Current: {existing}"})
-
-    t.ResourceNames = ",".join(filtered) if filtered else ""
-
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
-        "status":           "removed",
-        "task_name":        t.Name,
-        "removed":          resource_name,
+        "status":             "removed",
+        "task_name":          t.Name,
+        "removed":            resource_name,
+        "count":              removed,
         "resource_names_now": t.ResourceNames,
     }, indent=2)
 
@@ -3105,6 +3309,8 @@ def update_resource(resource_name: str, new_name: str = "", max_units: float = -
         resource.CostPerUse = cost_per_use
         changed.append("cost_per_use")
 
+    if changed:
+        _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "status":  "updated",
         "name":    resource.Name,
@@ -3157,6 +3363,7 @@ def move_task(unique_id: int, after_unique_id: int) -> str:
     moved = _find_task(proj, unique_id)
     new_id = moved.ID if moved else None
 
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "status":    "moved",
         "unique_id": unique_id,
@@ -3275,6 +3482,7 @@ def copy_task_structure(source_unique_id: int, copies: int = 1) -> str:
                     "name":      t.Name,
                 })
 
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "status":       "copied",
         "source_name":  source.Name,
@@ -3337,6 +3545,8 @@ def cross_project_link(source_project: str, source_unique_id: int, target_projec
         "source":  {"project": src_proj.Name, "task": src_task.Name, "unique_id": source_unique_id},
         "target":  {"project": tgt_proj.Name, "task": tgt_task.Name, "unique_id": target_unique_id},
         "link_type": link_type,
+        "saved":   False,
+        "note":    "Cross-project edit applied in memory on the target project; save that project to persist (auto-save is skipped here to avoid saving the wrong active project).",
     }, indent=2)
 
 
@@ -3738,6 +3948,7 @@ def insert_subproject(file_path: str, after_unique_id: int = 0) -> str:
 
     count_after = proj.Tasks.Count
 
+    _save_if_active(app, proj)  # save only when the mutated target is the active project
     return json.dumps({
         "status":           "inserted",
         "file_path":        file_path,
@@ -3868,11 +4079,13 @@ def get_constraints() -> str:
 
 
 @mcp.tool()
-def delete_resource(resource_name: str) -> str:
+def delete_resource(resource_name: str, confirm: bool = False) -> str:
     """
     Delete a resource from the project pool (case-insensitive match).
     All task assignments referencing this resource are cleared first.
+    Irreversible after save — requires confirm=true in safe mode.
     """
+    _require_confirm(confirm, "delete_resource (%s)" % resource_name)
     app  = get_app()
     proj = get_proj(app)
 
@@ -3885,27 +4098,31 @@ def delete_resource(resource_name: str) -> str:
     if target is None:
         return json.dumps({"error": f"Resource '{resource_name}' not found."})
 
-    # Clear assignments first
+    # Clear assignments first. Report (don't swallow) failures — a partially
+    # cleared resource that then deletes shouldn't look fully clean to the client.
     assignments_cleared = 0
-    # Iterate in reverse to avoid index shifting
+    assignment_errors = []
     for i in range(target.Assignments.Count, 0, -1):
         try:
             target.Assignments(i).Delete()
             assignments_cleared += 1
-        except Exception:
-            pass
+        except Exception as e:
+            assignment_errors.append(str(e))
 
     name = target.Name
     try:
         target.Delete()
     except Exception as e:
-        return json.dumps({"error": f"Failed to delete resource: {e}"})
+        return json.dumps({"error": f"Failed to delete resource: {e}",
+                           "assignments_cleared": assignments_cleared,
+                           "assignment_errors": assignment_errors})
 
     app.FileSave()
     return json.dumps({
         "status":              "deleted",
         "name":                name,
         "assignments_cleared": assignments_cleared,
+        "assignment_errors":   assignment_errors,
     }, indent=2)
 
 
@@ -4048,15 +4265,17 @@ def health_check() -> str:
 
 
 @mcp.tool()
-def update_project(complete_through: str, set_0_or_100: bool = False) -> str:
+def update_project(complete_through: str, set_0_or_100: bool = False, confirm: bool = False) -> str:
     """
     Mark all tasks complete through a given date (the weekly PMO ritual).
     Tasks that should have finished by the date get their % complete updated.
+    Mass mutation that is saved — requires confirm=true in safe mode.
 
     Args:
         complete_through: Date as YYYY-MM-DD — tasks scheduled through this date are updated.
         set_0_or_100:     If True, tasks are set to 0% or 100% only (no partial). Default False.
     """
+    _require_confirm(confirm, "update_project (mass progress update through a date)")
     app  = get_app()
     proj = get_proj(app)
     dt   = _parse_date(complete_through)
@@ -4087,14 +4306,16 @@ def update_project(complete_through: str, set_0_or_100: bool = False) -> str:
 
 
 @mcp.tool()
-def reschedule_incomplete_work(reschedule_from: str = "") -> str:
+def reschedule_incomplete_work(reschedule_from: str = "", confirm: bool = False) -> str:
     """
     Move remaining work on incomplete tasks to start after the given date
-    (or the project status date if not specified).
+    (or the project status date if not specified). Mass mutation that is saved —
+    requires confirm=true in safe mode.
 
     Args:
         reschedule_from: Date as YYYY-MM-DD. Empty = use project status date.
     """
+    _require_confirm(confirm, "reschedule_incomplete_work (shifts remaining work)")
     app  = get_app()
     proj = get_proj(app)
 
@@ -4126,13 +4347,15 @@ def reschedule_incomplete_work(reschedule_from: str = "") -> str:
 
 
 @mcp.tool()
-def delete_calendar(calendar_name: str) -> str:
+def delete_calendar(calendar_name: str, confirm: bool = False) -> str:
     """
     Delete a base calendar by name. Cannot delete the project calendar.
+    Irreversible after save — requires confirm=true in safe mode.
 
     Args:
         calendar_name: Name of the calendar to delete.
     """
+    _require_confirm(confirm, "delete_calendar (%s)" % calendar_name)
     app  = get_app()
     proj = get_proj(app)
 
@@ -4153,14 +4376,16 @@ def delete_calendar(calendar_name: str) -> str:
 
 
 @mcp.tool()
-def delete_calendar_exception(calendar_name: str, exception_name: str) -> str:
+def delete_calendar_exception(calendar_name: str, exception_name: str, confirm: bool = False) -> str:
     """
     Remove a specific exception (holiday/non-working day) from a calendar.
+    Irreversible after save — requires confirm=true in safe mode.
 
     Args:
         calendar_name:  Name of the base calendar.
         exception_name: Name of the exception to remove.
     """
+    _require_confirm(confirm, "delete_calendar_exception (%s)" % exception_name)
     app  = get_app()
     proj = get_proj(app)
 
@@ -5186,10 +5411,18 @@ def what_if_delay(
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    print("Starting MS Project MCP Server...")
-    print("MS Project must be running with a file open before using tools.")
+def main():
+    """Console-script / module entry point. Starts the MCP server over stdio."""
+    # stdout is reserved for the MCP stdio JSON-RPC stream; banners MUST go to
+    # stderr or they corrupt the protocol.
+    import sys
+    print("Starting MS Project MCP Server...", file=sys.stderr)
+    print("MS Project must be running with a file open before using tools.", file=sys.stderr)
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
 
 
 # ---------------------------------------------------------------------------

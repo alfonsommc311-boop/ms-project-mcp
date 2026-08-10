@@ -12,26 +12,37 @@ Control Microsoft Project via COM automation through the Model Context Protocol 
 
 ## Quick Start
 
-1. **Start MS Project** and open a project file (or the server will create one).
+### 1-click install (Windows)
 
-2. **Register** in your `claude_desktop_config.json`:
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+This creates a virtual env, installs the `ms-project-mcp` command, and registers
+the server in Claude Code (user scope). Then **open Microsoft Project** with a file
+and **restart Claude Code**.
+
+### Manual install
+
+```powershell
+uv venv
+uv pip install .
+# or:  python -m venv .venv ;  .venv\Scripts\python -m pip install .
+```
+
+Register in your MCP client (`claude mcp add-json` or `claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
-    "msproject": {
-      "command": "python",
-      "args": ["/path/to/msproject/server.py"]
+    "ms-project": {
+      "command": "C:\\path\\to\\ms-project-mcp\\.venv\\Scripts\\ms-project-mcp.exe"
     }
   }
 }
 ```
 
-3. **Run standalone** (for testing):
-
-```bash
-python server.py
-```
+Run standalone for testing: `python -m ms_project_mcp`
 
 ## Tool Inventory (99 tools)
 
@@ -303,6 +314,21 @@ Single-file server (`server.py`, ~5,200 lines) using the FastMCP framework. All 
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, conventions, and how to submit changes.
 
-## License
+## Docs
 
-This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
+- [docs/PRODUCT.md](docs/PRODUCT.md) — product overview, editions and pricing.
+- [docs/RECIPES.md](docs/RECIPES.md) — ready-to-run vertical workflows (road
+  construction, EVM, weekly PMO status).
+- [ROADMAP_COMERCIAL.md](ROADMAP_COMERCIAL.md) — commercialization roadmap.
+
+## License & commercial use
+
+Dual-licensed:
+
+- **Open source:** MIT License — see [LICENSE](LICENSE). Provided "AS IS".
+- **Commercial:** an optional commercial license ([EULA.md](EULA.md)) adds
+  warranty, support, updates and indemnification. See [docs/PRODUCT.md](docs/PRODUCT.md).
+
+Attribution and trademark notices: see [NOTICE](NOTICE). "Microsoft Project®" is a
+trademark of Microsoft Corporation; this product is independent and not affiliated
+with Microsoft.

@@ -3,15 +3,41 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = []
+packages = ["ms_project_mcp"]
 
 [project]
 name = "ms-project-mcp"
-version = "0.1.0"
-description = "MCP server for Microsoft Project via COM automation"
+version = "0.2.0"
+description = "MCP server for Microsoft Project Desktop via COM automation (99 tools)"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Ibrahim Elsahafy" }]
+keywords = [
+    "mcp",
+    "microsoft-project",
+    "msproject",
+    "com",
+    "automation",
+    "project-management",
+    "gantt",
+    "pmo",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Office/Business :: Scheduling",
+]
 dependencies = [
     "mcp>=1.0.0",
     "pywin32>=306",
     "python-dateutil>=2.9.0",
 ]
+
+[project.scripts]
+ms-project-mcp = "ms_project_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/alfonsommc311-boop/ms-project-mcp"
+Issues = "https://github.com/alfonsommc311-boop/ms-project-mcp/issues"
